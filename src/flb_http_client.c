@@ -270,7 +270,7 @@ static int process_chunked_data(struct flb_http_client *c)
     long val;
     char *p;
     char tmp[32];
-    struct flb_http_response *r = &c->resp;    
+    struct flb_http_response *r = &c->resp;
     int found_full_chunk = FLB_FALSE;
 
  chunk_start:
@@ -384,7 +384,7 @@ static int process_chunked_data(struct flb_http_client *c)
     if (found_full_chunk == FLB_TRUE) {
         return FLB_HTTP_CHUNK_AVAILABLE;
     }
-    return FLB_HTTP_MORE;    
+    return FLB_HTTP_MORE;
 }
 
 static int process_data(struct flb_http_client *c)
@@ -1179,6 +1179,12 @@ int flb_http_bearer_auth(struct flb_http_client *c, const char *token)
     return result;
 }
 
+/* flb_http_do_request only sends the http request the data.
+*  This is useful for processing the chunked responses on your own.
+*  If you do not want to process the response on your own or expect 
+*  all response data before you process data, use flb_http_do instead.
+*/
+int flb_http_do_request(struct flb_http_client *c, size_t *bytes) 
 /* flb_http_do_request only sends the http request the data.
 *  This is useful for processing the chunked responses on your own.
 *  If you do not want to process the response on your own or expect 
