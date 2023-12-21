@@ -42,6 +42,8 @@
 static int k8s_events_sql_insert_event(struct k8s_events *ctx, msgpack_object *item);
 #endif
 
+#define JSON_ARRAY_DELIM "\r\n"
+
 static int file_to_buffer(const char *path,
                           char **out_buf, size_t *out_size)
 {
@@ -366,7 +368,136 @@ static bool check_event_is_filtered(struct k8s_events *ctx, msgpack_object *obj,
     return FLB_FALSE;
 }
 
-static int process_events(struct k8s_events *ctx, char *in_data, size_t in_size, uint64_t *max_resource_version, flb_sds_t *continue_token)
+
+static int process_event_object(struct k8s_events* ctx, flb_sds_t action,
+                         msgpack_object* item) 
+{
+    int ret = -1;
+    struct flb_time ts;
+    struct flb_ra_value *rval;
+    uint64_t resource_version;
+    msgpack_object* item_metadata;
+ 
+    if(strncmp(action, "ADDED", 5) != 0 && strncmp(action, "MODIFIED", 8) != 0 ) {
+        //We don't process DELETED nor BOOKMARK
+        return 0;
+    }
+
+    item_metadata = record_get_field_ptr(item, "metadata");
+    if (item_metadata == NULL) {
+        flb_plg_warn(ctx->ins, "Event without metadata");
+        return -1;
+    }
+    ret = record_get_field_uint64(item_metadata,
+                                "resourceVersion", &resource_version);
+    if (ret == -1) {
+        return ret;
+    }
+
+    /* reset the log encoder */
+    flb_log_event_encoder_reset(ctx->encoder);
+
+    /* print every item from the items array */
+    if (item->type != MSGPACK_OBJECT_MAP) {
+        flb_plg_error(ctx->ins, "Cannot unpack item in response");
+        return -1;
+    }
+
+    if (check_event_is_filtered(ctx, item) == FLB_TRUE) {
+        return 0;
+    }
+
+#ifdef FLB_HAVE_SQLDB
+    if (ctx->db) {
+        k8s_events_sql_insert_event(ctx, item);
+    }
+#endif
+
+    /* get event timestamp */
+    rval = flb_ra_get_value_object(ctx->ra_timestamp, *item);
+    if (!rval || rval->type != FLB_RA_STRING) {
+        flb_plg_error(ctx->ins, "cannot retrieve event timestamp");
+        return -1;
+    }
+
+    /* convert timestamp */
+    ret = timestamp_lookup(ctx, rval->val.string, &ts);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "cannot lookup event timestamp");
+        flb_ra_key_value_destroy(rval);
+        return -1;
+    }
+
+    if (resource_version > ctx->last_resource_version) {
+        flb_plg_debug(ctx->ins, "set last resourceVersion=%lu", resource_version);
+        ctx->last_resource_version = resource_version;
+    }
+
+    /* encode content as a log event */
+    flb_log_event_encoder_begin_record(ctx->encoder);
+    flb_log_event_encoder_set_timestamp(ctx->encoder, &ts);
+
+    ret = flb_log_event_encoder_set_body_from_msgpack_object(ctx->encoder, item);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_commit_record(ctx->encoder);
+    } else {
+        flb_plg_warn(ctx->ins, "unable to encode: %llu", resource_version);
+    }
+    flb_ra_key_value_destroy(rval);    
+
+    if (ctx->encoder->output_length > 0) {
+        flb_input_log_append(ctx->ins, NULL, 0,
+                             ctx->encoder->output_buffer,
+                             ctx->encoder->output_length);
+    }
+
+    return 0;
+}
+
+static int process_watched_event(struct k8s_events *ctx, char *buf_data, size_t buf_size) {
+    int ret = -1;
+    size_t off = 0;
+    msgpack_unpacked result;
+    msgpack_object root;
+    msgpack_object *item = NULL;
+    flb_sds_t event_type = NULL;
+    
+    /* unpack */
+    msgpack_unpacked_init(&result);
+    ret = msgpack_unpack_next(&result, buf_data, buf_size, &off);
+    if (ret != MSGPACK_UNPACK_SUCCESS) {
+        flb_plg_error(ctx->ins, "Cannot unpack response");
+        return -1;
+    }
+
+    root = result.data;
+    if (root.type != MSGPACK_OBJECT_MAP) {
+        return -1;
+    }    
+
+    ret = record_get_field_sds(&root, "type", &event_type);
+    if (ret == -1) {
+        flb_plg_warn(ctx->ins, "Streamed Event 'type' not found");
+        goto msg_error;
+    }
+
+    item = record_get_field_ptr(&root, "object");
+    if (item == NULL || item->type != MSGPACK_OBJECT_MAP) {
+        flb_plg_warn(ctx->ins, "Streamed Event 'object' not found");
+        ret = -1;
+        goto msg_error;
+    }
+
+    ret = process_event_object(ctx, event_type, item);
+
+msg_error:
+    flb_sds_destroy(event_type);
+    msgpack_unpacked_destroy(&result);
+    return ret;
+}
+
+static int process_event_list(struct k8s_events *ctx, char *in_data, size_t in_size,
+                          uint64_t *max_resource_version, flb_sds_t *continue_token)
 {
     int i;
     int ret = -1;
@@ -375,16 +506,13 @@ static int process_events(struct k8s_events *ctx, char *in_data, size_t in_size,
     char *buf_data;
     size_t buf_size;
     size_t off = 0;
-    struct flb_time ts;
-    uint64_t resource_version;
     msgpack_unpacked result;
     msgpack_object root;
     msgpack_object k;
     msgpack_object *items = NULL;
     msgpack_object *item = NULL;
-    msgpack_object *item_metadata = NULL;
     msgpack_object *metadata = NULL;
-
+    const flb_sds_t action = "ADDED"; //All items from a k8s list we consider an 'ADDED' type
 
     ret = flb_pack_json(in_data, in_size, &buf_data, &buf_size, &root_type, &consumed);
     if (ret == -1) {
@@ -437,84 +565,32 @@ static int process_events(struct k8s_events *ctx, char *in_data, size_t in_size,
     }
 
     if (metadata == NULL) {
-        flb_plg_error(ctx->ins, "Cannot find metatada in response");
+        flb_plg_error(ctx->ins, "Cannot find metadata in response");
         goto msg_error;
     }
 
+    ret = record_get_field_uint64(metadata, "resourceVersion", max_resource_version);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "Cannot find EventList resourceVersion");
+            goto msg_error;
+    }    
+
     ret = record_get_field_sds(metadata, "continue", continue_token);
     if (ret == -1) {
-        if (ret == -1) {
-            flb_plg_error(ctx->ins, "Cannot process continue token");
-            goto msg_error;
-        }
+        flb_plg_error(ctx->ins, "Cannot process continue token");
+        goto msg_error;
     }
 
-    for (i = 0; i < items->via.array.size; i++) {
-        if (items->via.array.ptr[i].type != MSGPACK_OBJECT_MAP) {
-            flb_plg_warn(ctx->ins, "Event that is not a map");
-            continue;
-        }
-        item_metadata = record_get_field_ptr(&items->via.array.ptr[i], "metadata");
-        if (item_metadata == NULL) {
-            flb_plg_warn(ctx->ins, "Event without metadata");
-            continue;
-        }
-        ret = record_get_field_uint64(item_metadata,
-                                      "resourceVersion", &resource_version);
-        if (ret == -1) {
-            continue;
-        }
-        if (resource_version > *max_resource_version) {
-            *max_resource_version = resource_version;
-        }
-    }
-
-    /* reset the log encoder */
-    flb_log_event_encoder_reset(ctx->encoder);
-
-    /* print every item from the items array */
     for (i = 0; i < items->via.array.size; i++) {
         item = &items->via.array.ptr[i];
         if (item->type != MSGPACK_OBJECT_MAP) {
             flb_plg_error(ctx->ins, "Cannot unpack item in response");
             goto msg_error;
         }
-
-        /* get event timestamp */
-        ret = item_get_timestamp(item, &ts);
-        if (ret == FLB_FALSE) {
-            flb_plg_error(ctx->ins, "cannot retrieve event timestamp");
-            goto msg_error;
-        }
-
-        if (check_event_is_filtered(ctx, item, &ts) == FLB_TRUE) {
-            continue;
-        }
-
-#ifdef FLB_HAVE_SQLDB
-        if (ctx->db) {
-            k8s_events_sql_insert_event(ctx, item);
-        }
-#endif
-
-        /* encode content as a log event */
-        flb_log_event_encoder_begin_record(ctx->encoder);
-        flb_log_event_encoder_set_timestamp(ctx->encoder, &ts);
-
-        ret = flb_log_event_encoder_set_body_from_msgpack_object(ctx->encoder, item);
-        if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-            ret = flb_log_event_encoder_commit_record(ctx->encoder);
-        } else {
-            flb_plg_warn(ctx->ins, "unable to encode: %llu", resource_version);
-        }
+        process_event_object(ctx, action, item);
     }
 
-    if (ctx->encoder->output_length > 0) {
-        flb_input_log_append(ctx->ins, NULL, 0,
-                             ctx->encoder->output_buffer,
-                             ctx->encoder->output_length);
-    }
-
+    
 msg_error:
     msgpack_unpacked_destroy(&result);
 unpack_error:
@@ -523,13 +599,34 @@ json_error:
     return ret;
 }
 
-static struct flb_http_client *make_event_api_request(struct k8s_events *ctx,
+static struct flb_http_client *make_event_watch_api_request(struct k8s_events *ctx,
+                                                      struct flb_connection *u_conn,                                                      
+                                                      uint64_t max_resource_version) {
+    flb_sds_t url;
+    struct flb_http_client *c;
+
+    if (ctx->namespace == NULL) {
+        url = flb_sds_create(K8S_EVENTS_KUBE_API_URI);
+    } else {
+        url = flb_sds_create_size(strlen(K8S_EVENTS_KUBE_NAMESPACE_API_URI) + 
+                                  strlen(ctx->namespace));
+        flb_sds_printf(&url, K8S_EVENTS_KUBE_NAMESPACE_API_URI, ctx->namespace);
+    }
+
+    flb_sds_printf(&url, "?watch=1&resourceVersion=%llu", max_resource_version);
+    flb_plg_info(ctx->ins, "Requesting %s", url);
+    c = flb_http_client(u_conn, FLB_HTTP_GET, url,
+                        NULL, 0, ctx->api_host, ctx->api_port, NULL, 0);
+    flb_sds_destroy(url);
+    return c;
+ }
+
+static struct flb_http_client *make_event_list_api_request(struct k8s_events *ctx,
                                                       struct flb_connection *u_conn,
                                                       flb_sds_t continue_token)
 {
     flb_sds_t url;
     struct flb_http_client *c;
-
 
     if (continue_token == NULL && ctx->limit_request == 0 && ctx->namespace == NULL) {
         return flb_http_client(u_conn, FLB_HTTP_GET, K8S_EVENTS_KUBE_API_URI,
@@ -652,6 +749,54 @@ static int k8s_events_sql_insert_event(struct k8s_events *ctx, msgpack_object *i
 
 #endif
 
+static int process_http_chunk(struct k8s_events* ctx, struct flb_http_client *c, 
+                size_t *bytes_consumed)
+{
+    int ret = 0;
+    char *token = NULL;
+    int root_type;
+    size_t consumed = 0;
+    char *buf_data = NULL;
+    size_t buf_size;
+    flb_sds_t payload;
+    
+    //we copy payload because tokenizer will overwrite when it finds end of string
+    payload = flb_sds_create_len(c->resp.payload, c->resp.payload_size);
+
+    token = strtok(payload, JSON_ARRAY_DELIM);
+    while ( token != NULL && ret == 0 ) {
+        ret = flb_pack_json(token, strlen(token), &buf_data, &buf_size, &root_type, &consumed);
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "could not process payload, incomplete or bad formed JSON: %s", token);
+        } else {
+            *bytes_consumed += strlen(token) + 1;
+            ret = process_watched_event(ctx, buf_data, buf_size);
+        }
+    
+        flb_free(buf_data);
+        if (buf_data) {
+            buf_data = NULL;
+        }
+        token = strtok(NULL, JSON_ARRAY_DELIM);
+    } 
+
+    if (buf_data) {
+        flb_free(buf_data);
+    }
+    flb_sds_destroy(payload);
+    return ret;
+}
+
+static void initialize_http_client(struct flb_http_client* c, struct k8s_events* ctx)
+{
+    flb_http_buffer_size(c, 0);
+
+    flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
+    if (ctx->auth_len > 0) {
+        flb_http_add_header(c, "Authorization", 13, ctx->auth, ctx->auth_len);
+    }
+}
+
 static int k8s_events_collect(struct flb_input_instance *ins,
                               struct flb_config *config, void *in_context)
 {
@@ -662,6 +807,8 @@ static int k8s_events_collect(struct flb_input_instance *ins,
     struct k8s_events *ctx = in_context;
     flb_sds_t continue_token = NULL;
     uint64_t max_resource_version = 0;
+    size_t bytes_consumed;
+    int chunk_proc_ret;
 
     if (pthread_mutex_trylock(&ctx->lock) != 0) {
         FLB_INPUT_RETURN(0);
@@ -680,7 +827,7 @@ static int k8s_events_collect(struct flb_input_instance *ins,
     }
 
     do {
-        c = make_event_api_request(ctx, u_conn, continue_token);
+        c = make_event_list_api_request(ctx, u_conn, continue_token);
         if (continue_token != NULL) {
             flb_sds_destroy(continue_token);
             continue_token = NULL;
@@ -689,37 +836,64 @@ static int k8s_events_collect(struct flb_input_instance *ins,
             flb_plg_error(ins, "unable to create http client");
             goto exit;
         }
-        flb_http_buffer_size(c, 0);
-
-        flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
-        if (ctx->auth_len > 0) {
-            flb_http_add_header(c, "Authorization", 13, ctx->auth, ctx->auth_len);
-        }
-
+        initialize_http_client(c, ctx);
         ret = flb_http_do(c, &b_sent);
         if (ret != 0) {
             flb_plg_error(ins, "http do error");
             goto exit;
         }
 
-        if (c->resp.status == 200) {
-            ret = process_events(ctx, c->resp.payload, c->resp.payload_size, &max_resource_version, &continue_token);
+        if (c->resp.status == 200 && c->resp.payload_size > 0) {
+            ret = process_event_list(ctx, c->resp.payload, c->resp.payload_size,
+                                     &max_resource_version, &continue_token);
         }
-        else {
+        else 
+        {
             if (c->resp.payload_size > 0) {
                 flb_plg_error(ctx->ins, "http_status=%i:\n%s", c->resp.status, c->resp.payload);
             }
             else {
                 flb_plg_error(ctx->ins, "http_status=%i", c->resp.status);
             }
+            goto exit;
         }
         flb_http_client_destroy(c);
         c = NULL;
     } while(continue_token != NULL);
+    
+    //Now that we've done a full list, we can use the resource version and do a watch
+    //to stream updates efficiently    
+    c = make_event_watch_api_request(ctx, u_conn, max_resource_version);
+    if (!c) {
+        flb_plg_error(ins, "unable to create http client");
+        goto exit;
+    }
+    initialize_http_client(c, ctx);
 
-    if (max_resource_version > ctx->last_resource_version) {
-        flb_plg_debug(ctx->ins, "set last resourceVersion=%llu", max_resource_version);
-        ctx->last_resource_version = max_resource_version;
+    // Watch will stream chunked json data, so we only send
+    // the http request, then use flb_http_get_available_chunks
+    // to attempt processing on available streamed data
+    b_sent = 0;
+    ret = flb_http_do_request(c, &b_sent);
+    if (ret != 0) {
+        flb_plg_error(ins, "http do request error");
+        goto exit;
+    }
+
+    ret = FLB_HTTP_MORE;
+    bytes_consumed = 0;
+    chunk_proc_ret = 0;
+    while ((ret == FLB_HTTP_MORE || ret == FLB_HTTP_CHUNK_AVAILABLE) && chunk_proc_ret == 0) {
+        ret = flb_http_get_available_chunks(c, bytes_consumed);
+        bytes_consumed = 0;
+        if( c->resp.status == 200 && ret == FLB_HTTP_CHUNK_AVAILABLE ) {
+            chunk_proc_ret = process_http_chunk(ctx, c, &bytes_consumed);
+        }
+    }
+    // NOTE: skipping any processing after streaming socket closes
+
+    if (c->resp.status != 200) {
+        flb_plg_warn(ins, "events watch failure, http_status=%d payload=%s", c->resp.status, c->resp.payload);
     }
 
 exit:
