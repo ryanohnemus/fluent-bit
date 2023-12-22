@@ -506,6 +506,8 @@ static int process_event_list(struct k8s_events *ctx, char *in_data, size_t in_s
     char *buf_data;
     size_t buf_size;
     size_t off = 0;
+    struct flb_time ts;
+    uint64_t resource_version;
     msgpack_unpacked result;
     msgpack_object root;
     msgpack_object k;
@@ -1035,12 +1037,6 @@ static struct flb_config_map config_map[] = {
       FLB_CONFIG_MAP_STR, "kube_namespace", NULL,
       0, FLB_TRUE, offsetof(struct k8s_events, namespace),
       "kubernetes namespace to get events from, gets event from all namespaces by default."
-    },
-
-    {
-       FLB_CONFIG_MAP_STR, "timestamp_key", NULL,
-       0, FLB_TRUE, offsetof(struct k8s_events, timestamp_key),
-       "Deprecated. To be removed in v3.0"
     },
 
 #ifdef FLB_HAVE_SQLDB
