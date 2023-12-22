@@ -374,7 +374,6 @@ static int process_event_object(struct k8s_events* ctx, flb_sds_t action,
 {
     int ret = -1;
     struct flb_time ts;
-    struct flb_ra_value *rval;
     uint64_t resource_version;
     msgpack_object* item_metadata;
  
@@ -403,7 +402,14 @@ static int process_event_object(struct k8s_events* ctx, flb_sds_t action,
         return -1;
     }
 
-    if (check_event_is_filtered(ctx, item) == FLB_TRUE) {
+    /* get event timestamp */
+    ret = item_get_timestamp(item, &ts);
+    if (ret == FLB_FALSE) {
+        flb_plg_error(ctx->ins, "cannot retrieve event timestamp");
+        return -1;
+    }
+
+    if (check_event_is_filtered(ctx, item, (time_t)&ts) == FLB_TRUE) {
         return 0;
     }
 
@@ -412,26 +418,6 @@ static int process_event_object(struct k8s_events* ctx, flb_sds_t action,
         k8s_events_sql_insert_event(ctx, item);
     }
 #endif
-
-    /* get event timestamp */
-    rval = flb_ra_get_value_object(ctx->ra_timestamp, *item);
-    if (!rval || rval->type != FLB_RA_STRING) {
-        flb_plg_error(ctx->ins, "cannot retrieve event timestamp");
-        return -1;
-    }
-
-    /* convert timestamp */
-    ret = timestamp_lookup(ctx, rval->val.string, &ts);
-    if (ret == -1) {
-        flb_plg_error(ctx->ins, "cannot lookup event timestamp");
-        flb_ra_key_value_destroy(rval);
-        return -1;
-    }
-
-    if (resource_version > ctx->last_resource_version) {
-        flb_plg_debug(ctx->ins, "set last resourceVersion=%lu", resource_version);
-        ctx->last_resource_version = resource_version;
-    }
 
     /* encode content as a log event */
     flb_log_event_encoder_begin_record(ctx->encoder);
@@ -443,7 +429,6 @@ static int process_event_object(struct k8s_events* ctx, flb_sds_t action,
     } else {
         flb_plg_warn(ctx->ins, "unable to encode: %llu", resource_version);
     }
-    flb_ra_key_value_destroy(rval);    
 
     if (ctx->encoder->output_length > 0) {
         flb_input_log_append(ctx->ins, NULL, 0,
@@ -862,6 +847,11 @@ static int k8s_events_collect(struct flb_input_instance *ins,
         flb_http_client_destroy(c);
         c = NULL;
     } while(continue_token != NULL);
+
+    if (max_resource_version > ctx->last_resource_version) {
+        flb_plg_debug(ctx->ins, "set last resourceVersion=%lu", max_resource_version);
+        ctx->last_resource_version = max_resource_version;
+    }
     
     //Now that we've done a full list, we can use the resource version and do a watch
     //to stream updates efficiently    
