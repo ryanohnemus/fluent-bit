@@ -1185,12 +1185,6 @@ int flb_http_bearer_auth(struct flb_http_client *c, const char *token)
 *  all response data before you process data, use flb_http_do instead.
 */
 int flb_http_do_request(struct flb_http_client *c, size_t *bytes) 
-/* flb_http_do_request only sends the http request the data.
-*  This is useful for processing the chunked responses on your own.
-*  If you do not want to process the response on your own or expect 
-*  all response data before you process data, use flb_http_do instead.
-*/
-int flb_http_do_request(struct flb_http_client *c, size_t *bytes) 
 {
     int ret;
     int crlf = 2;

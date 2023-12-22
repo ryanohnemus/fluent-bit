@@ -53,7 +53,6 @@
 #define FLB_HTTP_OK               1
 #define FLB_HTTP_NOT_FOUND        2 /* header not found */
 #define FLB_HTTP_CHUNK_AVAILABLE  3 /* means chunk is available, but there is more data. end of all chunks returns FLB_HTTP_OK */
-#define FLB_HTTP_CHUNK_AVAILABLE  3 /* means chunk is available, but there is more data. end of all chunks returns FLB_HTTP_OK */
 
 /* Useful headers */
 #define FLB_HTTP_HEADER_AUTH             "Authorization"
